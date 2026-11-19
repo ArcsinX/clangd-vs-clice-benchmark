@@ -6,7 +6,7 @@ LLVM CMake compilation database. It stages the source files,
 headers, compilation database, and per-run caches in an output directory you
 choose. The LLVM checkout and build can live anywhere.
 
-The accompanying personal comparison is at <https://arcsinx.github.io/>.
+The accompanying personal comparison is at <https://arcsinx.github.io/clangd-vs-clice/>.
 
 ## Requirements
 
