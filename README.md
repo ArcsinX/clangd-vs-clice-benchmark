@@ -36,7 +36,16 @@ override those paths individually. The generated LLVM headers are staged from
 the build directory. The harness removes binary PCH inputs from the CMake
 commands and keeps the corresponding forced textual includes. The SDK path comes from `xcrun`. Use `--jobs` to change the worker
 ceiling, `--limit` for a smoke run and `--order` to set the order of the tools.
-The default order is clangd, clice, clice, clangd, clangd, clice.
+The default order is clangd, clice, clice, clangd, clangd, clice. To resume an
+interrupted series, keep the completed run directories, move any unfinished
+ones out of the output directory, and rerun with the same arguments plus
+`--resume`.
+
+Run this from a regular macOS Terminal. Check
+`sysctl -n vm.page_reusable_count` if clice repeatedly kills its indexing
+workers. clice 1.0.0's macOS resource detection requires this query, and some
+execution sandboxes deny it. When the query fails, the scheduler can treat
+available headroom as zero and skip units.
 
 The published workload has 723 existing unique source paths, with 245 from
 clangd and 478 from clang-tidy. One stale compilation database row refers to a
@@ -58,7 +67,9 @@ Locks, logs, and compiler artifact caches are outside the measurement.
 ## Read the results
 
 - Each elapsed time covers the LSP session from sending `initialized` and
-  `didOpen` through the background-index progress end. Fresh on-disk caches are
+  `didOpen` through the final background-index progress end. If clice logs
+  queued retries, the harness keeps processing progress until those attempts
+  finish or reach a terminal failure. Fresh on-disk caches are
   used for every run. Operating-system file caches are left alone.
 - Every approximately 200 ms, the harness walks the server's process tree and
   adds up resident memory across live processes. It stores the sum,

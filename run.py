@@ -117,6 +117,22 @@ def receive(pipe, messages):
     finally:
         messages.put(None)
 
+def clice_index_state(logs):
+    """Read the latest outcome per unit from clice's background-index logs."""
+    prefix = r"\] \[\d+/\d+\] "
+    patterns = {
+        "indexed": r"Indexed (.+?) in \d+ ms",
+        "queued": r"(?:Indexing |The worker indexing )(.+?)(?: again later:| died; it is indexed again later:)",
+        "failed": r"(?:Not indexing (.+?) again \(|(.+?) does not fit in memory:)",
+    }
+    events = [
+        (match.start(), next(group for group in match.groups() if group), state)
+        for state, pattern in patterns.items()
+        for match in re.finditer(prefix + pattern, logs)
+    ]
+    return {file: state for _, file, state in sorted(events)}
+
+
 def run(tool, binary, workspace, source, jobs, out, expected):
     cmd = [str(binary), "serve"] if tool == "clice" else [
         str(binary), f"-j={jobs}", "--enable-config=false", "--background-index",
@@ -179,7 +195,8 @@ def run(tool, binary, workspace, source, jobs, out, expected):
                 "uri": source.as_uri(), "languageId": "cpp" if source.suffix != ".c" else "c",
                 "version": 1, "text": source.read_text(),
             }})
-            observed_total = last_report = milestone = 0
+            observed_total = last_report = milestone = passes = 0
+            expected_files = set(expected)
             while True:
                 packet = message()
                 if "method" in packet and "id" in packet:
@@ -200,6 +217,13 @@ def run(tool, binary, workspace, source, jobs, out, expected):
                         milestone = last_report
                         print(f"{tool} {last_report}/{total} after {at-trigger:.1f} s", flush=True)
                 if value["kind"] == "end":
+                    passes += 1
+                    if tool == "clice":
+                        states = clice_index_state((out / "stderr.log").read_text(errors="replace"))
+                        pending = sum(states.get(file) == "queued" for file in expected_files)
+                        if pending:
+                            print(f"clice will retry {pending} translation units", flush=True)
+                            continue
                     end = at
                     break
             stop.set()
@@ -226,8 +250,9 @@ def run(tool, binary, workspace, source, jobs, out, expected):
         ok = re.findall(r"\] Indexed (.*?) \(\d+ symbols, \d+ refs, \d+ files\)", logs)
         bad = re.findall(r"\] Indexing .*? failed:", logs)
     else:
-        ok = re.findall(r"\] Indexed (.*?) in \d+ ms", logs)
-        bad = re.findall(r"\] (?:.*does not fit in memory|Index failed|Indexing .*? failed|Failed to index).*", logs, re.I)
+        states = clice_index_state(logs)
+        ok = [file for file, state in states.items() if state == "indexed"]
+        bad = [file for file, state in states.items() if state == "failed"]
     indexed_units = {
         str(Path(item).relative_to(workspace)) if Path(item).is_absolute()
         and Path(item).is_relative_to(workspace) else item for item in ok
@@ -238,7 +263,7 @@ def run(tool, binary, workspace, source, jobs, out, expected):
         "shard_write_errors": logs.count("Failed to write background-index shard"),
         "memory_worker_kills": logs.count("killed to free memory"),
         "missing_units": sorted(set(expected) - indexed_units),
-        "lsp_progress_total": observed_total, "lsp_final_report_completed": last_report,
+        "lsp_progress_total": observed_total, "background_passes": passes, "lsp_final_report_completed": last_report,
         "lsp_end": value.get("message"), "sample_count": len(indexing),
         "peak_rss_mib": round(max(x[1] for x in indexing) / MIB, 2),
         "average_rss_mib": round(statistics.mean(x[1] for x in indexing) / MIB, 2),
@@ -262,6 +287,7 @@ def main():
     p.add_argument("--clangd", type=Path, required=True)
     p.add_argument("--clice", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--resume", action="store_true", help="Keep existing completed runs with the same inputs")
     p.add_argument("--jobs", type=int, default=4)
     p.add_argument("--scope", choices=SCOPES, default="clangd-tidy")
     p.add_argument("--limit", type=int)
@@ -274,7 +300,6 @@ def main():
     out = args.out.resolve()
     if args.jobs < 1 or (args.limit is not None and args.limit < 1):
         p.error("Jobs and any input limit must be positive")
-    out.mkdir(parents=True)
     sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
     compiler = (args.compiler or build / "bin/clang++").resolve()
     database = (args.database or build / "compile_commands.json").resolve()
@@ -282,9 +307,25 @@ def main():
     if not rows:
         p.error("The LLVM compilation database has no matching source files")
     expected = [str(file.relative_to(llvm)) for file, _ in rows]
-    (out / "translation-units.txt").write_text("\n".join(expected) + "\n")
+    manifest = "\n".join(expected) + "\n"
+    manifest_path = out / "translation-units.txt"
+    if args.resume:
+        if not manifest_path.is_file() or manifest_path.read_text() != manifest:
+            p.error("The existing run must use the same translation-unit manifest")
+    else:
+        out.mkdir(parents=True)
+        manifest_path.write_text(manifest)
     for i, tool in enumerate(args.order, 1):
         directory = out / f"{i}-{tool}"
+        if args.resume and directory.exists():
+            result = directory / "result.json"
+            if not result.is_file():
+                p.error(f"Move the unfinished run directory before resuming: {directory}")
+            previous = json.loads(result.read_text())["summary"]
+            if previous["tool"] != tool or previous["requested_units"] != len(expected):
+                p.error(f"Run does not match the requested experiment: {directory}")
+            print(f"Keeping {directory.name}", flush=True)
+            continue
         directory.mkdir()
         workspace = directory / "workspace"
         source = setup(llvm, build, rows, workspace, args.jobs, sdk, compiler)
