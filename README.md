@@ -43,6 +43,18 @@ clangd and 478 from clang-tidy. One stale compilation database row refers to a
 missing clangd source file. The translation-unit manifest records the exact
 selection.
 
+## Measure the disk index
+
+After the runs exit cleanly, use the same output directory.
+
+```sh
+python3 index_size.py ./tmp/clangd-tidy
+```
+
+The script reports file count, logical bytes, and bytes allocated by the file
+system. It reads only clangd's `*.idx` shards and clice's `index.mdb` data file.
+Locks, logs, and compiler artifact caches are outside the measurement.
+
 ## Read the results
 
 - Each elapsed time covers the LSP session from sending `initialized` and
